@@ -9,7 +9,10 @@
 
 Безопасно перезапускать: если .md уже есть — файл пропускается.
 
-Запуск:
+Работает одинаково на macOS, Linux и Windows: нужен только Python 3.8+ и ffmpeg.
+Никаких pip-пакетов и никакого curl — всё на стандартной библиотеке.
+
+Запуск (на Windows пиши python вместо python3):
   Один файл:
     python3 transcribe.py "/путь/к/файлу.mp4"
   Вся папка (рекурсивно):
@@ -18,61 +21,159 @@
     python3 transcribe.py "/путь/к/папке" --plan
   С разделением по спикерам (Deepgram nova-2 — для диалогов/интервью, нужен DEEPGRAM_API_KEY):
     python3 transcribe.py "/путь/к/папке" --speakers
+  Проверить, что всё установлено:
+    python3 transcribe.py --check
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import json
+import mimetypes
+import os
+import platform
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import uuid
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+IS_WINDOWS = platform.system() == "Windows"
+PY = "python" if IS_WINDOWS else "python3"
 
-
-# ── Groq API key ──────────────────────────────────────────────────────────────
-def load_groq_key() -> str:
-    key = os.environ.get("GROQ_API_KEY")
-    if key:
-        return key
-    env_path = os.path.join(SCRIPT_DIR, ".env")
-    if os.path.exists(env_path):
-        for line in open(env_path, encoding="utf-8"):
-            line = line.strip()
-            if line.startswith("GROQ_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    print("ERROR: GROQ_API_KEY не найден (ни в переменных окружения, ни в .env)")
-    print("Получи бесплатный ключ на https://console.groq.com/keys и положи его в .env рядом со скриптом:")
-    print('  GROQ_API_KEY=gsk_твой_ключ')
-    sys.exit(1)
-
-
-GROQ_KEY = load_groq_key()
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 MAX_BYTES = 24 * 1024 * 1024  # 24 МБ — лимит Groq
 CHUNK_SECONDS = 600  # 10 минут на кусок (при 16kHz mono 32k mp3 ~ 2.4 МБ/10мин)
-
-
-# ── Deepgram API key (для --speakers) ──────────────────────────────────────────
-def load_deepgram_key() -> str | None:
-    key = os.environ.get("DEEPGRAM_API_KEY")
-    if key:
-        return key
-    env_path = os.path.join(SCRIPT_DIR, ".env")
-    if os.path.exists(env_path):
-        for line in open(env_path, encoding="utf-8"):
-            line = line.strip()
-            if line.startswith("DEEPGRAM_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return None
-
-
-DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
+HTTP_TIMEOUT = 900  # секунд на один запрос
 
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 AUDIO_EXTS = (".ogg", ".mp3", ".m4a", ".aac", ".wav", ".opus")
 
 
+# ── Ключи из .env или окружения ───────────────────────────────────────────────
+def read_env_value(name: str) -> str | None:
+    """Ищет значение сначала в переменных окружения, потом в .env рядом со скриптом."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    env_path = os.path.join(SCRIPT_DIR, ".env")
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{name}="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def load_groq_key() -> str:
+    key = read_env_value("GROQ_API_KEY")
+    if key:
+        return key
+    print("ОШИБКА: GROQ_API_KEY не найден (ни в переменных окружения, ни в .env)")
+    print("Получи бесплатный ключ на https://console.groq.com/keys")
+    print(f"и положи его в файл .env рядом со скриптом ({os.path.join(SCRIPT_DIR, '.env')}):")
+    print("  GROQ_API_KEY=gsk_твой_ключ")
+    sys.exit(1)
+
+
+def load_deepgram_key() -> str | None:
+    return read_env_value("DEEPGRAM_API_KEY")
+
+
+# ── Проверка окружения ────────────────────────────────────────────────────────
+def ffmpeg_install_hint() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        return "brew install ffmpeg"
+    if system == "Windows":
+        return ("winget install Gyan.FFmpeg   (или choco install ffmpeg, "
+                "или вручную с https://www.gyan.dev/ffmpeg/builds/ — сборка essentials, "
+                "папку bin добавить в PATH)")
+    return "sudo apt install ffmpeg"
+
+
+def require_tool(name: str):
+    """Проверяет, что ffmpeg/ffprobe виден в PATH. Иначе — понятная ошибка вместо трейсбека."""
+    if shutil.which(name) is None:
+        print(f"ОШИБКА: {name} не найден в PATH.")
+        print(f"Установи ffmpeg: {ffmpeg_install_hint()}")
+        print("После установки открой терминал заново (PATH подхватывается при запуске).")
+        sys.exit(1)
+
+
+def proxy_note() -> str:
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("ALL_PROXY")
+    return f"да ({proxy})" if proxy else "нет (прямое подключение)"
+
+
+def run_check():
+    """python3 transcribe.py --check — показывает, что готово, а что нет."""
+    print(f"ОС:        {platform.system()} {platform.release()}")
+    print(f"Python:    {platform.python_version()} ({sys.executable})")
+    for tool in ("ffmpeg", "ffprobe"):
+        path = shutil.which(tool)
+        print(f"{tool + ':':10} {path if path else 'НЕ НАЙДЕН — ' + ffmpeg_install_hint()}")
+    groq = read_env_value("GROQ_API_KEY")
+    deepgram = read_env_value("DEEPGRAM_API_KEY")
+    print(f"GROQ_API_KEY:     {'есть' if groq and not groq.startswith('gsk_твой') else 'НЕ ЗАДАН'}")
+    print(f"DEEPGRAM_API_KEY: {'есть' if deepgram and not deepgram.startswith('твой') else 'не задан (нужен только для --speakers)'}")
+    print(f"Прокси:    {proxy_note()}")
+    ok = shutil.which("ffmpeg") and shutil.which("ffprobe") and groq and not groq.startswith("gsk_твой")
+    print("\nГотово к работе." if ok else "\nЕсть чего не хватает — см. выше.")
+
+
+# ── HTTP на стандартной библиотеке (без curl) ─────────────────────────────────
+def http_post(url: str, headers: dict, body: bytes, retries: int = 3) -> bytes:
+    """POST с ретраями. Прокси берётся из HTTPS_PROXY/ALL_PROXY автоматически."""
+    last_error = ""
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            last_error = f"HTTP {e.code}: {detail}"
+            if e.code in (400, 401, 403, 404, 413):
+                break  # ретраи не помогут — ключ, лимит или формат
+        except Exception as e:  # сеть, таймаут, прокси
+            last_error = f"{type(e).__name__}: {e}"
+        if attempt < retries - 1:
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(last_error or "запрос не удался")
+
+
+def build_multipart(fields: dict, file_path: str, file_field: str = "file") -> tuple[bytes, str]:
+    """Собирает multipart/form-data тело вручную — чтобы не тянуть requests."""
+    boundary = "----transcribebatch" + uuid.uuid4().hex
+    crlf = b"\r\n"
+    parts = []
+    for name, value in fields.items():
+        parts.append(b"--" + boundary.encode() + crlf)
+        parts.append(f'Content-Disposition: form-data; name="{name}"'.encode() + crlf + crlf)
+        parts.append(str(value).encode("utf-8") + crlf)
+
+    filename = os.path.basename(file_path)
+    ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    with open(file_path, "rb") as f:
+        payload = f.read()
+    parts.append(b"--" + boundary.encode() + crlf)
+    parts.append(
+        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"'.encode()
+        + crlf
+    )
+    parts.append(f"Content-Type: {ctype}".encode() + crlf + crlf)
+    parts.append(payload + crlf)
+    parts.append(b"--" + boundary.encode() + b"--" + crlf)
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+# ── Текст ─────────────────────────────────────────────────────────────────────
 def add_paragraphs(text: str, sentences_per_paragraph: int = 4) -> str:
     """Режет сплошной текст на абзацы: каждые N предложений = новый абзац.
        Последовательности типа '?!' или '...' считаются одним терминатором."""
@@ -117,10 +218,7 @@ def output_path_for(media_path: str) -> str:
     return base + ".расшифровка.md"
 
 
-# Прокси из окружения (curl сам подхватит HTTPS_PROXY); используем --noproxy только если он не задан
-USE_PROXY = bool(os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY"))
-
-
+# ── ffmpeg ────────────────────────────────────────────────────────────────────
 def extract_audio(video_path: str, out_mp3: str):
     """Извлекает аудио в mp3 mono 16kHz 32kbps."""
     cmd = [
@@ -129,20 +227,20 @@ def extract_audio(video_path: str, out_mp3: str):
         "-ar", "16000", "-ac", "1", "-b:a", "32k",
         out_mp3,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg извлечение аудио упало: {r.stderr[-400:]}")
+        raise RuntimeError(f"ffmpeg извлечение аудио упало: {(r.stderr or '')[-400:]}")
 
 
 def get_duration(path: str) -> float:
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True,
-    )
     try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, errors="replace",
+        )
         return float(r.stdout.strip())
-    except ValueError:
+    except (ValueError, OSError):
         return 0.0
 
 
@@ -154,48 +252,46 @@ def split_audio(mp3_path: str, chunk_dir: str) -> list[str]:
         "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
         "-c", "copy", pattern,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg нарезка упала: {r.stderr[-400:]}")
-    chunks = sorted(
+        raise RuntimeError(f"ffmpeg нарезка упала: {(r.stderr or '')[-400:]}")
+    return sorted(
         os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir)
         if f.startswith("chunk_") and f.endswith(".mp3")
     )
-    return chunks
 
 
-def transcribe_chunk(chunk_path: str) -> str:
-    """Отправляет один кусок в Groq Whisper, возвращает текст. 3 попытки."""
-    args = [
-        "curl", "-s", "--fail-with-body", "-X", "POST", GROQ_URL,
-        "-H", f"Authorization: Bearer {GROQ_KEY}",
-        "-F", "model=whisper-large-v3",
-        "-F", "response_format=text",
-        "-F", "temperature=0",
-        "-F", "language=ru",
-        "-F", f"file=@{chunk_path};type=audio/mpeg",
-    ]
-    if not USE_PROXY:
-        args[1:1] = ["--noproxy", "*"]
+# ── Groq ──────────────────────────────────────────────────────────────────────
+def transcribe_chunk(chunk_path: str, key: str) -> str:
+    """Отправляет один кусок в Groq Whisper, возвращает текст."""
+    body, content_type = build_multipart(
+        {
+            "model": "whisper-large-v3",
+            "response_format": "text",
+            "temperature": "0",
+            "language": "ru",
+        },
+        chunk_path,
+    )
+    raw = http_post(
+        GROQ_URL,
+        {"Authorization": f"Bearer {key}", "Content-Type": content_type},
+        body,
+    )
+    text = raw.decode("utf-8", "replace").strip()
+    if not text:
+        raise RuntimeError("Groq вернул пустой ответ")
+    return text
 
-    for attempt in range(3):
-        r = subprocess.run(args, capture_output=True, text=True)
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-        if attempt < 2:
-            time.sleep(2)
-    raise RuntimeError(f"Groq не ответил: {r.stdout[-200:]} {r.stderr[-200:]}")
 
-
-def transcribe_video(video_path: str) -> str:
-    """Полный путь: видео/аудио → mp3 → куски → текст."""
+def transcribe_video(video_path: str, key: str) -> str:
+    """Полный путь: видео/аудио -> mp3 -> куски -> текст."""
     with tempfile.TemporaryDirectory() as tmp:
         mp3 = os.path.join(tmp, "audio.mp3")
         extract_audio(video_path, mp3)
 
-        size = os.path.getsize(mp3)
-        if size <= MAX_BYTES:
-            return transcribe_chunk(mp3)
+        if os.path.getsize(mp3) <= MAX_BYTES:
+            return transcribe_chunk(mp3, key)
 
         chunk_dir = os.path.join(tmp, "chunks")
         os.makedirs(chunk_dir)
@@ -203,28 +299,25 @@ def transcribe_video(video_path: str) -> str:
         parts = []
         for i, c in enumerate(chunks, 1):
             print(f"      кусок {i}/{len(chunks)}...", flush=True)
-            parts.append(transcribe_chunk(c))
+            parts.append(transcribe_chunk(c, key))
         return " ".join(parts)
 
 
+# ── Deepgram (разделение по спикерам) ─────────────────────────────────────────
 def transcribe_deepgram(mp3_path: str, key: str) -> str:
     """Отправляет аудио в Deepgram nova-2 с diarization, возвращает текст.
-       Монолог (один спикер занимает ≥80% реплик) — без меток, диалог — с "Спикер N:"."""
-    args = [
-        "curl", "-s", "--fail-with-body", "-X", "POST",
-        f"{DEEPGRAM_URL}?model=nova-2&detect_language=true&diarize=true&punctuate=true&utterances=true",
-        "-H", f"Authorization: Token {key}",
-        "-H", "Content-Type: audio/mpeg",
-        "--data-binary", f"@{mp3_path}",
-    ]
-    if not USE_PROXY:
-        args[1:1] = ["--noproxy", "*"]
+       Монолог (один спикер занимает >=80% реплик) — без меток, диалог — с "Спикер N:"."""
+    with open(mp3_path, "rb") as f:
+        payload = f.read()
+    url = (f"{DEEPGRAM_URL}?model=nova-2&detect_language=true"
+           "&diarize=true&punctuate=true&utterances=true")
+    raw = http_post(
+        url,
+        {"Authorization": f"Token {key}", "Content-Type": "audio/mpeg"},
+        payload,
+    )
+    data = json.loads(raw.decode("utf-8", "replace"))
 
-    r = subprocess.run(args, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"Deepgram не ответил: {r.stdout[-300:]} {r.stderr[-300:]}")
-
-    data = json.loads(r.stdout)
     utterances = data.get("results", {}).get("utterances") or []
     if not utterances:
         return data["results"]["channels"][0]["alternatives"][0]["transcript"]
@@ -249,13 +342,14 @@ def transcribe_deepgram(mp3_path: str, key: str) -> str:
 
 
 def transcribe_video_speakers(video_path: str, key: str) -> str:
-    """Видео/аудио → mp3 → Deepgram с разделением по спикерам."""
+    """Видео/аудио -> mp3 -> Deepgram с разделением по спикерам."""
     with tempfile.TemporaryDirectory() as tmp:
         mp3 = os.path.join(tmp, "audio.mp3")
         extract_audio(video_path, mp3)
         return transcribe_deepgram(mp3, key)
 
 
+# ── Обход папки ───────────────────────────────────────────────────────────────
 def collect_targets(root: str) -> list[str]:
     """Дедуп по папке:
        - если в папке есть аудио (.ogg и т.п.) — это главный урок; берём аудио,
@@ -279,16 +373,28 @@ def collect_targets(root: str) -> list[str]:
     return sorted(targets)
 
 
-def main():
-    if len(sys.argv) < 2:
-        print('Использование:')
-        print('  python3 transcribe.py "/путь/к/файлу.mp4"')
-        print('  python3 transcribe.py "/путь/к/папке"          (рекурсивно, все аудио/видео)')
-        print('  python3 transcribe.py "/путь/к/папке" --plan   (только план, без запуска)')
-        print('  python3 transcribe.py "/путь/к/папке" --speakers   (с разделением по спикерам, Deepgram)')
-        sys.exit(1)
+def print_usage():
+    print("Использование:")
+    print(f'  {PY} transcribe.py "путь/к/файлу.mp4"')
+    print(f'  {PY} transcribe.py "путь/к/папке"          (рекурсивно, все аудио/видео)')
+    print(f'  {PY} transcribe.py "путь/к/папке" --plan   (только план, без запуска)')
+    print(f'  {PY} transcribe.py "путь/к/папке" --speakers  (с разделением по спикерам, Deepgram)')
+    print(f"  {PY} transcribe.py --check                 (проверить установку)")
 
-    root = sys.argv[1]
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print_usage()
+        sys.exit(1)
+    if "--check" in args:
+        run_check()
+        return
+
+    root = args[0]
+    plan_only = "--plan" in args
+    speakers_mode = "--speakers" in args
+
     if os.path.isfile(root):
         targets = [root]
         base_dir = os.path.dirname(root) or "."
@@ -299,26 +405,29 @@ def main():
         print(f"Не найдено: {root}")
         sys.exit(1)
 
-    plan_only = "--plan" in sys.argv
-    speakers_mode = "--speakers" in sys.argv
-
+    groq_key = None
     deepgram_key = None
-    if speakers_mode and not plan_only:
-        deepgram_key = load_deepgram_key()
-        if not deepgram_key:
-            print("ERROR: DEEPGRAM_API_KEY не найден (нужен для --speakers).")
-            print("Получи ключ на https://console.deepgram.com/ и добавь в .env:")
-            print("  DEEPGRAM_API_KEY=твой_ключ")
-            sys.exit(1)
+    if not plan_only:
+        require_tool("ffmpeg")
+        require_tool("ffprobe")
+        if speakers_mode:
+            deepgram_key = load_deepgram_key()
+            if not deepgram_key:
+                print("ОШИБКА: DEEPGRAM_API_KEY не найден (нужен для --speakers).")
+                print("Получи ключ на https://console.deepgram.com/ и добавь в .env:")
+                print("  DEEPGRAM_API_KEY=твой_ключ")
+                sys.exit(1)
+        else:
+            groq_key = load_groq_key()
 
     print(f"Найдено файлов для транскрипции: {len(targets)}")
     print(f"Движок: {'Deepgram nova-2 (спикеры)' if speakers_mode else 'Groq Whisper (без спикеров)'}")
-    print(f"Прокси: {'да (' + (os.environ.get('HTTPS_PROXY') or os.environ.get('ALL_PROXY')) + ')' if USE_PROXY else 'нет (прямое подключение)'}\n")
+    print(f"Прокси: {proxy_note()}\n")
 
     if plan_only:
         for i, path in enumerate(targets, 1):
             md_path = output_path_for(path)
-            mark = "уже есть" if os.path.exists(md_path) else "→ обработать"
+            mark = "уже есть" if os.path.exists(md_path) else "обработать"
             rel = os.path.relpath(path, base_dir)
             print(f"[{i:2}] {mark:12} {rel}")
         print("\n(это только план, транскрипция не запущена — убери --plan чтобы запустить)")
@@ -342,11 +451,11 @@ def main():
                 if "Спикер " not in text:
                     text = add_paragraphs(text)
             else:
-                text = add_paragraphs(transcribe_video(path))
+                text = add_paragraphs(transcribe_video(path, groq_key))
             title = os.path.splitext(name)[0]
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(f"# {title}\n\n{text}\n")
-            print(f"      готово за {(time.time()-t0)/60:.1f} мин → {os.path.basename(md_path)}")
+            print(f"      готово за {(time.time()-t0)/60:.1f} мин: {os.path.basename(md_path)}")
             done += 1
         except Exception as e:
             print(f"      ОШИБКА: {e}")
