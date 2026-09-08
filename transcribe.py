@@ -19,7 +19,7 @@
     python3 transcribe.py "/путь/к/папке"
   Только план (что будет обработано, без запуска):
     python3 transcribe.py "/путь/к/папке" --plan
-  С разделением по спикерам (Deepgram nova-2 — для диалогов/интервью, нужен DEEPGRAM_API_KEY):
+  С разделением по спикерам (Deepgram nova-3 — для диалогов/интервью, нужен DEEPGRAM_API_KEY):
     python3 transcribe.py "/путь/к/папке" --speakers
   На движке Deepgram вместо Groq (нужен там, где Groq не обслуживает страну — например в РФ):
     python3 transcribe.py "/путь/к/папке" --deepgram
@@ -48,6 +48,14 @@ PY = "python" if IS_WINDOWS else "python3"
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
+
+# Модели распознавания. Менять здесь — больше нигде не зашиты.
+# Groq:     whisper-large-v3 — самая точная у Groq. Есть whisper-large-v3-turbo:
+#           быстрее и дешевле, но заметно слабее на русском.
+# Deepgram: nova-3 — новее и точнее nova-2 на русской живой речи (лучше пунктуация,
+#           меньше выдуманных слов, чище разделение по спикерам).
+GROQ_MODEL = "whisper-large-v3"
+DEEPGRAM_MODEL = "nova-3"
 MAX_BYTES = 24 * 1024 * 1024  # 24 МБ — лимит Groq
 CHUNK_SECONDS = 600  # 10 минут на кусок (при 16kHz mono 32k mp3 ~ 2.4 МБ/10мин)
 HTTP_TIMEOUT = 900  # секунд на один запрос
@@ -268,7 +276,7 @@ def transcribe_chunk(chunk_path: str, key: str) -> str:
     """Отправляет один кусок в Groq Whisper, возвращает текст."""
     body, content_type = build_multipart(
         {
-            "model": "whisper-large-v3",
+            "model": GROQ_MODEL,
             "response_format": "text",
             "temperature": "0",
             "language": "ru",
@@ -307,11 +315,11 @@ def transcribe_video(video_path: str, key: str) -> str:
 
 # ── Deepgram (разделение по спикерам) ─────────────────────────────────────────
 def transcribe_deepgram(mp3_path: str, key: str) -> str:
-    """Отправляет аудио в Deepgram nova-2 с diarization, возвращает текст.
+    """Отправляет аудио в Deepgram nova-3 с diarization, возвращает текст.
        Монолог (один спикер занимает >=80% реплик) — без меток, диалог — с "Спикер N:"."""
     with open(mp3_path, "rb") as f:
         payload = f.read()
-    url = (f"{DEEPGRAM_URL}?model=nova-2&detect_language=true"
+    url = (f"{DEEPGRAM_URL}?model={DEEPGRAM_MODEL}&detect_language=true"
            "&diarize=true&punctuate=true&utterances=true")
     raw = http_post(
         url,
@@ -428,9 +436,9 @@ def main():
 
     print(f"Найдено файлов для транскрипции: {len(targets)}")
     if speakers_mode:
-        engine_name = "Deepgram nova-2 (с разделением по спикерам)"
+        engine_name = "Deepgram nova-3 (с разделением по спикерам)"
     elif deepgram_mode:
-        engine_name = "Deepgram nova-2"
+        engine_name = "Deepgram nova-3"
     else:
         engine_name = "Groq Whisper"
     print(f"Движок: {engine_name}")

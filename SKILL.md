@@ -19,6 +19,14 @@ description: |
 
 Работает одинаково в Claude Code и в Codex, на macOS, Linux и Windows.
 
+## Модели
+
+- Groq — `whisper-large-v3` (по умолчанию, из России не работает)
+- Deepgram — `nova-3` (флаг `--deepgram` / `--speakers`, из России работает)
+
+Заданы константами `GROQ_MODEL` и `DEEPGRAM_MODEL` в начале `transcribe.py`.
+Просят поменять модель — меняй там, в других местах они не зашиты.
+
 ## Где лежит скрипт
 
 `transcribe.py` — рядом с этим файлом SKILL.md, в этой же папке.
