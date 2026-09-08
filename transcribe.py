@@ -21,6 +21,8 @@
     python3 transcribe.py "/путь/к/папке" --plan
   С разделением по спикерам (Deepgram nova-2 — для диалогов/интервью, нужен DEEPGRAM_API_KEY):
     python3 transcribe.py "/путь/к/папке" --speakers
+  На движке Deepgram вместо Groq (нужен там, где Groq не обслуживает страну — например в РФ):
+    python3 transcribe.py "/путь/к/папке" --deepgram
   Проверить, что всё установлено:
     python3 transcribe.py --check
 """
@@ -379,6 +381,7 @@ def print_usage():
     print(f'  {PY} transcribe.py "путь/к/папке"          (рекурсивно, все аудио/видео)')
     print(f'  {PY} transcribe.py "путь/к/папке" --plan   (только план, без запуска)')
     print(f'  {PY} transcribe.py "путь/к/папке" --speakers  (с разделением по спикерам, Deepgram)')
+    print(f'  {PY} transcribe.py "путь/к/папке" --deepgram  (движок Deepgram вместо Groq)')
     print(f"  {PY} transcribe.py --check                 (проверить установку)")
 
 
@@ -394,6 +397,7 @@ def main():
     root = args[0]
     plan_only = "--plan" in args
     speakers_mode = "--speakers" in args
+    deepgram_mode = speakers_mode or "--deepgram" in args
 
     if os.path.isfile(root):
         targets = [root]
@@ -410,18 +414,26 @@ def main():
     if not plan_only:
         require_tool("ffmpeg")
         require_tool("ffprobe")
-        if speakers_mode:
+        if deepgram_mode:
             deepgram_key = load_deepgram_key()
             if not deepgram_key:
-                print("ОШИБКА: DEEPGRAM_API_KEY не найден (нужен для --speakers).")
+                flag = "--speakers" if speakers_mode else "--deepgram"
+                print(f"ОШИБКА: DEEPGRAM_API_KEY не найден (нужен для {flag}).")
                 print("Получи ключ на https://console.deepgram.com/ и добавь в .env:")
                 print("  DEEPGRAM_API_KEY=твой_ключ")
                 sys.exit(1)
         else:
             groq_key = load_groq_key()
+            deepgram_key = load_deepgram_key()  # запасной движок, если Groq не обслуживает страну
 
     print(f"Найдено файлов для транскрипции: {len(targets)}")
-    print(f"Движок: {'Deepgram nova-2 (спикеры)' if speakers_mode else 'Groq Whisper (без спикеров)'}")
+    if speakers_mode:
+        engine_name = "Deepgram nova-2 (с разделением по спикерам)"
+    elif deepgram_mode:
+        engine_name = "Deepgram nova-2"
+    else:
+        engine_name = "Groq Whisper"
+    print(f"Движок: {engine_name}")
     print(f"Прокси: {proxy_note()}\n")
 
     if plan_only:
@@ -446,12 +458,23 @@ def main():
         print(f"[{i}/{len(targets)}] {name}  (~{dur/60:.0f} мин)", flush=True)
         try:
             t0 = time.time()
-            if speakers_mode:
+            if deepgram_mode:
                 text = transcribe_video_speakers(path, deepgram_key)
                 if "Спикер " not in text:
                     text = add_paragraphs(text)
             else:
-                text = add_paragraphs(transcribe_video(path, groq_key))
+                try:
+                    text = add_paragraphs(transcribe_video(path, groq_key))
+                except RuntimeError as e:
+                    if "HTTP 403" not in str(e) or not deepgram_key:
+                        raise
+                    # Groq не обслуживает страну пользователя — переходим на Deepgram.
+                    # Настройки VPN/прокси пользователя при этом не трогаем.
+                    print("      Groq недоступен из этой страны (403), перехожу на Deepgram...", flush=True)
+                    deepgram_mode = True
+                    text = transcribe_video_speakers(path, deepgram_key)
+                    if "Спикер " not in text:
+                        text = add_paragraphs(text)
             title = os.path.splitext(name)[0]
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(f"# {title}\n\n{text}\n")
