@@ -320,7 +320,10 @@ def run_check():
     print(f"Файл .env: {os.path.join(SCRIPT_DIR, '.env')}")
     print("Проверяю ключи у сервисов...", flush=True)
 
+    key_unverified = False
     deepgram_ok, deepgram_note = probe_key("deepgram")
+    if "проверить не смог" in deepgram_note:
+        key_unverified = True
     print(f"DEEPGRAM_API_KEY: {deepgram_note}"
           + ("" if deepgram_ok else " — ключ берётся на https://console.deepgram.com/"))
     groq_key = read_env_value("GROQ_API_KEY")
@@ -330,6 +333,15 @@ def run_check():
     else:
         groq_ok, groq_note = probe_key("groq")
         print(f"GROQ_API_KEY:     {groq_note}")
+        if deepgram_ok and "проверить не смог" not in deepgram_note:
+            key_unverified = False
+    try:
+        import yt_dlp  # noqa: F401
+        ytdlp_note = "есть"
+    except ImportError:
+        ytdlp_note = ("не установлен — ссылки на YouTube и другие видеохостинги работать "
+                      f"не будут ({PY} -m pip install -U yt-dlp)")
+    print(f"yt-dlp:    {ytdlp_note}")
     print(f"Прокси:    {proxy_note()}")
     if IS_WINDOWS:
         print("Windows:   запускай командой python (не python3) — python3 открывает "
@@ -337,6 +349,12 @@ def run_check():
 
     tools_ok = find_tool("ffmpeg") and find_tool("ffprobe")
     if tools_ok and (deepgram_ok or groq_ok):
+        if key_unverified:
+            # Ключ вписан, но подтвердить у сервиса не вышло. Объявлять это
+            # готовностью нельзя: на файле всё равно упадёт, только позже.
+            print("\nПочти готово: ключ на месте, но проверить его у сервиса не удалось "
+                  "(см. выше).\nПоявится интернет — прогони проверку ещё раз.")
+            return 1
         print("\nГотово к работе.")
         return 0
     print("\nЕсть чего не хватает — см. выше.")
