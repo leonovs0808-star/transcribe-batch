@@ -38,12 +38,14 @@ import json
 import mimetypes
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -72,7 +74,11 @@ HTTP_TIMEOUT = 1800  # секунд на один запрос (длинный �
 SPEAKERS_THRESHOLD_SECONDS = 180
 
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
-AUDIO_EXTS = (".ogg", ".mp3", ".m4a", ".aac", ".wav", ".opus")
+AUDIO_EXTS = (".ogg", ".mp3", ".m4a", ".aac", ".wav", ".opus", ".flac")
+
+# Видеохостинги, с которых звук снимается через yt-dlp — напрямую файл оттуда не скачать.
+YTDLP_HOSTS = ("youtube.com", "youtu.be", "vkvideo.ru", "vk.com/video", "vk.ru/video",
+               "rutube.ru", "kinescope.io", "dzen.ru", "vimeo.com")
 
 
 # ── Ключи из .env или окружения ───────────────────────────────────────────────
@@ -275,6 +281,173 @@ def output_path_for(media_path: str) -> tuple[str, bool]:
 
 
 # ── ffmpeg ────────────────────────────────────────────────────────────────────
+# ── Ссылки: YouTube и прочие видео, Яндекс.Диск, Google Drive, прямой файл ────
+def looks_like_url(value: str) -> bool:
+    return value.startswith("http://") or value.startswith("https://")
+
+
+def is_ytdlp_url(url: str) -> bool:
+    """Видеохостинг, откуда файл забирается через yt-dlp, а не прямой загрузкой."""
+    return any(h in url for h in YTDLP_HOSTS)
+
+
+def http_get_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "transcribe-batch"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def safe_filename(name: str) -> str:
+    """Убирает из имени всё, на чём спотыкается файловая система."""
+    name = re.sub(r'[\\/:*?"<>|]+', " ", name).strip()
+    name = re.sub(r"\s+", " ", name)
+    return name[:150] or "запись"
+
+
+def name_from_headers(resp) -> str | None:
+    """Вытаскивает имя файла из Content-Disposition — у Дисков оно только там."""
+    cd = resp.headers.get("Content-Disposition") or ""
+    m = re.search(r"filename\*=UTF-8''([^;]+)", cd) or re.search(r'filename="?([^";]+)"?', cd)
+    if not m:
+        return None
+    return safe_filename(urllib.parse.unquote(m.group(1).strip()))
+
+
+def download_stream(url: str, out_path: str) -> str | None:
+    """Качает файл по прямой ссылке, показывая прогресс — большие видео идут долго.
+       Возвращает имя файла, если сервер его подсказал."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 transcribe-batch"})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp, open(out_path, "wb") as f:
+        suggested = name_from_headers(resp)
+        total = int(resp.headers.get("Content-Length") or 0)
+        got = 0
+        last_shown = 0
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            if got - last_shown >= 5 * 1024 * 1024:  # отчитываемся раз в 5 МБ
+                last_shown = got
+                if total:
+                    print(f"      скачано {got // 1048576} из {total // 1048576} МБ", flush=True)
+                else:
+                    print(f"      скачано {got // 1048576} МБ", flush=True)
+    print(f"      скачано {os.path.getsize(out_path) // 1048576} МБ, готово", flush=True)
+    return suggested
+
+
+def resolve_gdrive(file_id: str) -> str:
+    """Прямая ссылка на файл Google Drive.
+       На больших файлах Google сначала отдаёт HTML со страницей подтверждения —
+       тогда собираем адрес из формы на этой странице."""
+    initial = (f"https://drive.usercontent.google.com/download"
+               f"?id={file_id}&export=download&confirm=t")
+    req = urllib.request.Request(initial, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            if "text/html" not in ctype:
+                return initial
+            page = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError:
+        return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=1"
+
+    m = re.search(r'action="(https://drive\.usercontent\.google\.com/download[^"]+)"', page)
+    if m:
+        action = m.group(1).replace("&amp;", "&")
+        fields = dict(re.findall(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', page))
+        params = urllib.parse.urlencode(fields)
+        sep = "&" if "?" in action else "?"
+        return f"{action}{sep}{params}"
+    return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=1"
+
+
+def download_with_ytdlp(url: str, out_dir: str) -> str:
+    """Снимает звуковую дорожку с видеохостинга. Возвращает путь к файлу.
+
+    Дорожка берётся как есть (bestaudio), без перегона в mp3: лишнее сжатие
+    портит разделение по спикерам — та же причина, что в prepare_for_deepgram.
+    """
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "для ссылок на видеохостинги нужен yt-dlp, его нет.\n"
+            f"      Поставь одной командой:  {PY} -m pip install -U yt-dlp\n"
+            "      Ссылки на Яндекс.Диск, Google Drive и прямые файлы работают без него."
+        )
+    import yt_dlp
+
+    template = os.path.join(out_dir, "%(title)s.%(ext)s")
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": template,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,  # иначе полоса загрузки затирает строки нашего вывода
+        "socket_timeout": 60,
+        "retries": 3,
+        # YouTube регулярно меняет защиту — эти клиенты переживают её лучше прочих.
+        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
+    }
+    cookies = os.path.join(SCRIPT_DIR, "youtube_cookies.txt")
+    if os.path.exists(cookies):
+        opts["cookiefile"] = cookies
+
+    before = set(os.listdir(out_dir))
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    created = [f for f in os.listdir(out_dir) if f not in before]
+    if not created:
+        raise RuntimeError("yt-dlp ничего не скачал")
+    return os.path.join(out_dir, created[0])
+
+
+def download_url(url: str, out_dir: str) -> str:
+    """Любая поддерживаемая ссылка -> локальный файл. Возвращает путь к нему."""
+    if is_ytdlp_url(url):
+        print("      источник: видеохостинг, снимаю звуковую дорожку...", flush=True)
+        return download_with_ytdlp(url, out_dir)
+
+    gd = re.search(r"drive\.google\.com/file/d/([^/]+)", url)
+    if gd:
+        print("      источник: Google Drive", flush=True)
+        direct = resolve_gdrive(gd.group(1))
+        out = os.path.join(out_dir, "gdrive-файл")
+        suggested = download_stream(direct, out)
+        if suggested:
+            # Настоящее имя Google отдаёт только в заголовке ответа — берём его,
+            # иначе все скачанные файлы звались бы одинаково.
+            renamed = os.path.join(out_dir, suggested)
+            os.rename(out, renamed)
+            return renamed
+        return out
+
+    if any(h in url for h in ("disk.yandex.", "yadi.sk", "disk.360.yandex.")):
+        print("      источник: Яндекс.Диск", flush=True)
+        api = "https://cloud-api.yandex.net/v1/disk/public/resources"
+        key = urllib.parse.quote(url, safe="")
+        meta = http_get_json(f"{api}?public_key={key}")
+        if meta.get("type") == "dir":
+            raise RuntimeError(
+                "это ссылка на ПАПКУ Яндекс.Диска, а не на файл. "
+                "Дай ссылку на конкретный файл — либо скачай папку себе и укажи путь к ней."
+            )
+        name = safe_filename(meta.get("name") or "яндекс-диск-файл")
+        href = http_get_json(f"{api}/download?public_key={key}")["href"]
+        out = os.path.join(out_dir, name)
+        download_stream(href, out)
+        return out
+
+    print("      источник: прямая ссылка на файл", flush=True)
+    name = safe_filename(os.path.basename(urllib.parse.urlparse(url).path)) or "файл-по-ссылке"
+    out = os.path.join(out_dir, name)
+    download_stream(url, out)
+    return out
+
+
 def run_ffmpeg(cmd: list[str]):
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
@@ -444,8 +617,13 @@ def print_usage():
     print("Использование:")
     print(f'  {PY} transcribe.py "путь/к/файлу.mp4"')
     print(f'  {PY} transcribe.py "путь/к/папке"              (рекурсивно, все аудио/видео)')
+    print(f'  {PY} transcribe.py "https://youtu.be/..."      (ссылка: видео, Диски, прямой файл)')
     print(f'  {PY} transcribe.py "путь/к/папке" --plan       (только план, без запуска)')
     print(f"  {PY} transcribe.py --check                     (проверить установку)")
+    print()
+    print("Ссылки понимает: YouTube, ВК Видео, Рутуб, Кинескоп, Дзен, Vimeo,")
+    print("Яндекс.Диск, Google Drive, прямая ссылка на файл.")
+    print(f'  {PY} transcribe.py "<ссылка>" --out "папка"    (куда положить расшифровку)')
     print()
     print("Разделение по спикерам включается само на записях длиннее "
           f"{SPEAKERS_THRESHOLD_SECONDS // 60} минут. Перебить вручную:")
@@ -478,7 +656,24 @@ def main():
         print("ОШИБКА: --speakers и --no-speakers вместе не имеют смысла, выбери одно.")
         sys.exit(1)
 
-    if os.path.isfile(root):
+    # Куда класть результат для ссылок: рядом с файлом положить нельзя — файла
+    # на диске нет. Кладём в текущую папку, либо туда, куда сказали флагом --out.
+    out_dir = "."
+    if "--out" in args:
+        i = args.index("--out")
+        if i + 1 >= len(args):
+            print("ОШИБКА: после --out нужен путь к папке.")
+            sys.exit(1)
+        out_dir = args[i + 1]
+        if not os.path.isdir(out_dir):
+            print(f"ОШИБКА: папки нет: {out_dir}")
+            sys.exit(1)
+
+    is_url = looks_like_url(root)
+    if is_url:
+        targets = [root]
+        base_dir = out_dir
+    elif os.path.isfile(root):
         targets = [root]
         base_dir = os.path.dirname(root) or "."
     elif os.path.isdir(root):
@@ -486,6 +681,7 @@ def main():
         base_dir = root
     else:
         print(f"Не найдено: {root}")
+        print("Это должен быть путь к файлу, путь к папке или ссылка (http/https).")
         sys.exit(1)
 
     groq_key = None
@@ -515,6 +711,9 @@ def main():
 
     if plan_only:
         for i, path in enumerate(targets, 1):
+            if is_url:
+                print(f"[{i:2}] обработать   {path}")
+                continue
             _, already = output_path_for(path)
             mark = "уже есть" if already else "обработать"
             rel = os.path.relpath(path, base_dir)
@@ -523,20 +722,46 @@ def main():
         return
 
     done, skipped, failed = 0, 0, 0
-    for i, path in enumerate(targets, 1):
-        md_path, already = output_path_for(path)
-        name = os.path.basename(path)
-        if already:
-            print(f"[{i}/{len(targets)}] ПРОПУСК (расшифровка уже есть): {name}")
-            skipped += 1
-            continue
+    for i, source in enumerate(targets, 1):
+        # Ссылку сначала превращаем в файл на диске, дальше путь общий для всех.
+        downloaded_dir = None
+        if is_url:
+            print(f"[{i}/{len(targets)}] {source}", flush=True)
+            downloaded_dir = tempfile.TemporaryDirectory()
+            try:
+                path = download_url(source, downloaded_dir.name)
+            except Exception as e:
+                print(f"      ОШИБКА: {e}")
+                failed += 1
+                downloaded_dir.cleanup()
+                continue
+            title = os.path.splitext(os.path.basename(path))[0]
+            md_path = os.path.join(out_dir, title + ".md")
+            already = os.path.exists(md_path)
+            if already:
+                print(f"      ПРОПУСК (расшифровка уже есть): {os.path.basename(md_path)}")
+                skipped += 1
+                downloaded_dir.cleanup()
+                continue
+        else:
+            path = source
+            md_path, already = output_path_for(path)
+            if already:
+                print(f"[{i}/{len(targets)}] ПРОПУСК (расшифровка уже есть): "
+                      f"{os.path.basename(path)}")
+                skipped += 1
+                continue
 
+        name = os.path.basename(path)
         dur = get_duration(path)
         # Разговор или заметка — решает длительность, пока флаг не сказал иначе.
         diarize = force_speakers or (
             not force_no_speakers and dur > SPEAKERS_THRESHOLD_SECONDS
         )
-        print(f"[{i}/{len(targets)}] {name}  (~{dur/60:.0f} мин)", flush=True)
+        if is_url:
+            print(f"      {name}  (~{dur/60:.0f} мин)", flush=True)
+        else:
+            print(f"[{i}/{len(targets)}] {name}  (~{dur/60:.0f} мин)", flush=True)
         try:
             t0 = time.time()
             if not groq_mode:
@@ -564,6 +789,10 @@ def main():
         except Exception as e:
             print(f"      ОШИБКА: {e}")
             failed += 1
+        finally:
+            # Скачанное по ссылке не копим на диске — расшифровка уже сохранена.
+            if downloaded_dir:
+                downloaded_dir.cleanup()
 
     print(f"\nИтог: готово {done}, пропущено {skipped}, ошибок {failed}")
 
