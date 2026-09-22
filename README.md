@@ -89,7 +89,16 @@ git clone https://github.com/leonovs0808-star/transcribe-batch.git $env:USERPROF
 cp .env.example .env      # Windows PowerShell: copy .env.example .env
 ```
 
-Открой `.env` и впиши свой ключ Deepgram вместо `твой_ключ_отсюда_console.deepgram.com`.
+Впиши ключ одной командой — она сама положит его в нужный файл и сразу проверит,
+принимает ли его сервис:
+
+```bash
+python3 transcribe.py --set-key deepgram
+```
+
+Команда спросит ключ вводом (можно передать его и аргументом, но тогда он останется
+в истории терминала). Либо открой `.env` руками и замени
+`твой_ключ_отсюда_console.deepgram.com` на свой ключ.
 
 Ключ берётся на https://console.deepgram.com/ — регистрация по почте, **карту не
 спрашивают**. На счёт сразу кладут $200, и они не сгорают. По текущей цене nova-3

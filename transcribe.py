@@ -152,6 +152,58 @@ def proxy_note() -> str:
     return f"да ({proxy})" if proxy else "нет (прямое подключение)"
 
 
+def set_key(args: list[str]) -> int:
+    """python3 transcribe.py --set-key deepgram [КЛЮЧ] — кладёт ключ в .env скрипта.
+
+    Отдельная команда нужна, чтобы ключ не записывали самодельной строкой на питоне:
+    такая строка считает путь от текущей папки, и при забытом cd ключ уходит в чужой
+    .env — молча, с бодрым «ОК» в ответ. Здесь путь берётся от самого файла скрипта,
+    промахнуться некуда. Без второго аргумента ключ спрашивается вводом и не проходит
+    через чат с ИИ вообще.
+    """
+    known = {"deepgram": "DEEPGRAM_API_KEY", "groq": "GROQ_API_KEY"}
+    i = args.index("--set-key")
+    service = args[i + 1].lower() if len(args) > i + 1 else ""
+    if service not in known:
+        print("Использование: --set-key deepgram [КЛЮЧ]   (или groq вместо deepgram)")
+        print("Без КЛЮЧА скрипт спросит его вводом — тогда ключ не попадёт в переписку.")
+        return 1
+    var = known[service]
+
+    key = args[i + 2].strip() if len(args) > i + 2 else ""
+    if not key:
+        try:
+            key = input(f"Вставь {var} и нажми Enter: ").strip()
+        except EOFError:
+            print("ОШИБКА: ключ не введён.")
+            return 1
+    if not key or is_placeholder(key):
+        print("ОШИБКА: это не похоже на ключ.")
+        return 1
+
+    env_path = os.path.join(SCRIPT_DIR, ".env")
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    replaced = False
+    for n, line in enumerate(lines):
+        if line.strip().startswith(f"{var}="):
+            lines[n] = f"{var}={key}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{var}={key}")
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"Ключ записан: {env_path}")
+    print("Проверяю, принимает ли его сервис...", flush=True)
+    ok, note = probe_key(service)
+    print(f"{var}: {note}")
+    return 0 if ok else 1
+
+
 def probe_key(service: str) -> tuple[bool, str]:
     """Спрашивает у сервиса, принимает ли он ключ. Возвращает (годен, что сказать).
 
@@ -660,6 +712,7 @@ def print_usage():
     print(f'  {PY} transcribe.py "https://youtu.be/..."      (ссылка: видео, Диски, прямой файл)')
     print(f'  {PY} transcribe.py "путь/к/папке" --plan       (только план, без запуска)')
     print(f"  {PY} transcribe.py --check                     (проверить установку)")
+    print(f"  {PY} transcribe.py --set-key deepgram          (вписать ключ; спросит вводом)")
     print()
     print("Ссылки понимает: YouTube, ВК Видео, Рутуб, Кинескоп, Дзен, Vimeo,")
     print("Яндекс.Диск, Google Drive, прямая ссылка на файл.")
@@ -679,6 +732,8 @@ def main():
     if not args:
         print_usage()
         sys.exit(1)
+    if "--set-key" in args:
+        sys.exit(set_key(args))
     if "--check" in args:
         sys.exit(run_check())
 
@@ -826,7 +881,20 @@ def main():
             print(f"      готово за {(time.time()-t0)/60:.1f} мин: {os.path.basename(md_path)}")
             done += 1
         except Exception as e:
-            print(f"      ОШИБКА: {e}")
+            text = str(e)
+            if "HTTP 401" in text:
+                print("      ОШИБКА: сервис не принял ключ (401). Ключ скопирован с опечаткой "
+                      "или обрезан.")
+                print(f"      Создай новый на https://console.deepgram.com/ и впиши его:")
+                print(f"        {PY} transcribe.py --set-key deepgram")
+            elif "HTTP 403" in text:
+                print("      ОШИБКА: сервис не обслуживает твою страну (403).")
+                print("      Для Groq это нормально в РФ — запускай без --groq, на Deepgram.")
+            elif "HTTP 429" in text:
+                print("      ОШИБКА: слишком много запросов подряд (429). Подожди минуту "
+                      "и запусти снова — уже готовые файлы пропустятся.")
+            else:
+                print(f"      ОШИБКА: {e}")
             failed += 1
         finally:
             # Скачанное по ссылке не копим на диске — расшифровка уже сохранена.
