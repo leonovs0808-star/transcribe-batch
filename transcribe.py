@@ -41,6 +41,7 @@ import os
 import platform
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -99,11 +100,17 @@ def read_env_value(name: str) -> str | None:
         return value
     env_path = os.path.join(SCRIPT_DIR, ".env")
     if os.path.exists(env_path):
-        with open(env_path, encoding="utf-8") as f:
+        # utf-8-sig: Блокнот на Windows сохраняет с BOM, и без этого первая строка
+        # файла не распознаётся — ключ лежит в файле, а скрипт его «не видит».
+        # errors="replace": файл, сохранённый в ANSI/cp1251, не должен ронять прогон.
+        with open(env_path, encoding="utf-8-sig", errors="replace") as f:
             for line in f:
                 line = line.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
                 if line.startswith(f"{name}="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+                    value = line.split("=", 1)[1].strip()
+                    return value.strip('"').strip("'")
     return None
 
 
@@ -160,6 +167,12 @@ EXTRA_TOOL_DIRS = (
     "/snap/bin",              # Linux со snap
     os.path.expanduser("~/bin"),
     os.path.expanduser("~/.local/bin"),
+    # Windows: winget и choco прописывают PATH сами, но при ручной распаковке
+    # человек обычно кладёт ffmpeg в одно из этих мест и PATH не правит.
+    r"C:\ffmpeg\bin",
+    r"C:\Program Files\ffmpeg\bin",
+    r"C:\ProgramData\chocolatey\bin",
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
 )
 
 
@@ -187,7 +200,13 @@ def require_tool(name: str) -> str:
 
 
 def proxy_note() -> str:
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("ALL_PROXY")
+    """Что на самом деле с прокси. Переменных окружения мало: на Windows настройка
+       живёт в реестре, на macOS — в системных настройках, и urllib читает именно их."""
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:
+        proxies = {}
+    proxy = proxies.get("https") or proxies.get("http")
     return f"да ({proxy})" if proxy else "нет (прямое подключение)"
 
 
@@ -231,7 +250,7 @@ def set_key(args: list[str]) -> int:
     env_path = os.path.join(SCRIPT_DIR, ".env")
     lines = []
     if os.path.exists(env_path):
-        with open(env_path, encoding="utf-8") as f:
+        with open(env_path, encoding="utf-8-sig", errors="replace") as f:
             lines = f.read().splitlines()
     replaced = False
     for n, line in enumerate(lines):
@@ -275,15 +294,26 @@ def probe_key(service: str) -> tuple[bool, str]:
         if e.code == 403:
             return False, "вписан, но сервис не обслуживает твою страну (403)"
         return False, f"вписан, но сервис ответил HTTP {e.code}"
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, ssl.SSLError) or "SSL" in type(reason).__name__ or \
+                "CERTIFICATE" in str(reason).upper():
+            # Антивирус с проверкой защищённых соединений или прокси в режиме
+            # подмены сертификатов. Браузер работает, а скрипт — нет, и молча
+            # объявлять ключ годным тут нельзя: расшифровка всё равно не пойдёт.
+            return False, ("вписан, но соединение перехвачено (проблема с сертификатом). "
+                           "Так бывает при антивирусе с проверкой HTTPS или прокси в режиме "
+                           "подмены сертификатов — отключи проверку HTTPS для этой программы")
+        return True, f"вписан, проверить не смог ({reason}) — похоже, нет интернета"
     except Exception as e:
-        # Нет сети — это не повод объявлять ключ негодным.
         return True, f"вписан, проверить не смог ({type(e).__name__}) — похоже, нет интернета"
 
 
 def run_check():
     """python3 transcribe.py --check — показывает, что готово, а что нет."""
     print(f"ОС:        {platform.system()} {platform.release()}")
-    print(f"Python:    {platform.python_version()} ({sys.executable})")
+    print(f"Python:    {platform.python_version()} "
+          f"{platform.architecture()[0]} ({sys.executable})")
     for tool in ("ffmpeg", "ffprobe"):
         path = find_tool(tool)
         print(f"{tool + ':':10} {path if path else 'НЕ НАЙДЕН — ' + ffmpeg_install_hint()}")
@@ -301,6 +331,9 @@ def run_check():
         groq_ok, groq_note = probe_key("groq")
         print(f"GROQ_API_KEY:     {groq_note}")
     print(f"Прокси:    {proxy_note()}")
+    if IS_WINDOWS:
+        print("Windows:   запускай командой python (не python3) — python3 открывает "
+              "Microsoft Store")
 
     tools_ok = find_tool("ffmpeg") and find_tool("ffprobe")
     if tools_ok and (deepgram_ok or groq_ok):
@@ -395,9 +428,11 @@ def looks_like_our_transcript(md_path: str, media_path: str) -> bool:
     """Свою расшифровку узнаём по первой строке — скрипт пишет её как '# <имя файла>'."""
     title = os.path.splitext(os.path.basename(media_path))[0]
     try:
-        with open(md_path, encoding="utf-8") as f:
+        # errors="replace" и ValueError в перехвате: рядом с видео может лежать
+        # чужой конспект в cp1251 или UTF-16, и он не должен ронять весь прогон.
+        with open(md_path, encoding="utf-8-sig", errors="replace") as f:
             return f.readline().strip() == f"# {title}"
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -436,11 +471,26 @@ def http_get_json(url: str) -> dict:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
+# Имена, которые Windows держит за устройства: файл CON.mp3 открывается как консоль.
+WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} \
+    | {f"LPT{i}" for i in range(1, 10)}
+
+
 def safe_filename(name: str) -> str:
     """Убирает из имени всё, на чём спотыкается файловая система."""
-    name = re.sub(r'[\\/:*?"<>|]+', " ", name).strip()
-    name = re.sub(r"\s+", " ", name)
-    return name[:150] or "запись"
+    name = re.sub(r'[\\/:*?"<>|]+', " ", name)
+    name = "".join(ch for ch in name if ord(ch) > 31)  # управляющие символы
+    name = re.sub(r"\s+", " ", name).strip()
+    # Точка и пробел в конце имени на Windows отваливаются молча, ломая расширение.
+    name = name.rstrip(". ")
+    # 120 символов: к имени ещё добавится «.расшифровка.md», а у Windows общий
+    # лимит пути 260 символов, и его легко выбрать одной папкой в OneDrive.
+    name = name[:120].rstrip(". ")
+    if not name:
+        return "запись"
+    if os.path.splitext(name)[0].upper() in WINDOWS_RESERVED:
+        name = "_" + name
+    return name
 
 
 def name_from_headers(resp) -> str | None:
@@ -530,6 +580,7 @@ def download_with_ytdlp(url: str, out_dir: str) -> str:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,  # иначе полоса загрузки затирает строки нашего вывода
+        "trim_file_name": 100,  # длинный заголовок ролика + путь упираются в лимит Windows
         "socket_timeout": 60,
         "retries": 3,
         # YouTube регулярно меняет защиту — эти клиенты переживают её лучше прочих.
@@ -539,13 +590,18 @@ def download_with_ytdlp(url: str, out_dir: str) -> str:
     if os.path.exists(cookies):
         opts["cookiefile"] = cookies
 
-    before = set(os.listdir(out_dir))
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-    created = [f for f in os.listdir(out_dir) if f not in before]
-    if not created:
+        info = ydl.extract_info(url, download=True)
+    # Берём путь у самого yt-dlp. Раньше тут сравнивались списки файлов до и после,
+    # и при фрагментном скачивании можно было подхватить огрызок .part вместо записи.
+    downloads = (info or {}).get("requested_downloads") or []
+    if downloads and downloads[0].get("filepath"):
+        return downloads[0]["filepath"]
+    leftovers = [f for f in os.listdir(out_dir)
+                 if not f.endswith((".part", ".ytdl", ".temp"))]
+    if not leftovers:
         raise RuntimeError("yt-dlp ничего не скачал")
-    return os.path.join(out_dir, created[0])
+    return os.path.join(out_dir, leftovers[0])
 
 
 def download_url(url: str, out_dir: str) -> str:
@@ -564,7 +620,7 @@ def download_url(url: str, out_dir: str) -> str:
             # Настоящее имя Google отдаёт только в заголовке ответа — берём его,
             # иначе все скачанные файлы звались бы одинаково.
             renamed = os.path.join(out_dir, suggested)
-            os.rename(out, renamed)
+            os.replace(out, renamed)  # replace, а не rename: на Windows rename не перезаписывает
             return renamed
         return out
 
@@ -585,15 +641,19 @@ def download_url(url: str, out_dir: str) -> str:
         return out
 
     print("      источник: прямая ссылка на файл", flush=True)
-    name = safe_filename(os.path.basename(urllib.parse.urlparse(url).path)) or "файл-по-ссылке"
+    name = safe_filename(os.path.basename(urllib.parse.urlparse(url).path))
     out = os.path.join(out_dir, name)
     download_stream(url, out)
     return out
 
 
 def run_ffmpeg(cmd: list[str]):
-    cmd = [require_tool(cmd[0])] + cmd[1:]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    # -nostdin обязателен: иначе ffmpeg читает stdin, и прогон, запущенный в фоне
+    # (nohup … &), встаёт намертво по SIGTTIN — в логе тишина, человек ждёт часами.
+    cmd = [require_tool(cmd[0]), "-nostdin"] + cmd[1:]
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace",
+                       stdin=subprocess.DEVNULL)
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg извлечение аудио упало: {(r.stderr or '')[-400:]}")
 
@@ -638,7 +698,8 @@ def get_duration(path: str) -> float:
         r = subprocess.run(
             [require_tool("ffprobe"), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, errors="replace",
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.DEVNULL,
         )
         return float(r.stdout.strip())
     except (ValueError, OSError):
@@ -687,7 +748,8 @@ def transcribe_chunk(chunk_path: str, key: str) -> str:
 
 def transcribe_video(video_path: str, key: str) -> str:
     """Полный путь: видео/аудио -> mp3 -> куски -> текст."""
-    with tempfile.TemporaryDirectory() as tmp:
+    tmp = tempfile.mkdtemp()
+    try:
         mp3 = os.path.join(tmp, "audio.mp3")
         extract_audio(video_path, mp3)
 
@@ -702,6 +764,8 @@ def transcribe_video(video_path: str, key: str) -> str:
             print(f"      кусок {i}/{len(chunks)}...", flush=True)
             parts.append(transcribe_chunk(c, key))
         return " ".join(parts)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── Deepgram (разделение по спикерам) ─────────────────────────────────────────
@@ -740,9 +804,15 @@ def transcribe_deepgram(audio_path: str, key: str, diarize: bool, ctype: str) ->
 
 def transcribe_video_deepgram(media_path: str, key: str, diarize: bool) -> str:
     """Видео/аудио -> Deepgram. Аудио уходит как есть, из видео звук вынимается в FLAC."""
-    with tempfile.TemporaryDirectory() as tmp:
+    # Не `with`: на Windows удаление временной папки иногда срывается (антивирус или
+    # OneDrive ещё держат файл), и тогда исключение из уборки выбросило бы уже
+    # полученный — и уже оплаченный — текст расшифровки.
+    tmp = tempfile.mkdtemp()
+    try:
         audio, ctype = prepare_for_deepgram(media_path, tmp)
         return transcribe_deepgram(audio, key, diarize, ctype)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── Обход папки ───────────────────────────────────────────────────────────────
@@ -750,10 +820,21 @@ def collect_targets(root: str) -> list[str]:
     """Все аудио и видео в папке, рекурсивно. Ничего не отсеивает молча:
        что лежит в папке — то и будет расшифровано, список видно по --plan."""
     targets = []
-    for dirpath, _, files in os.walk(root):
+    skipped_dirs = []
+    for dirpath, dirnames, files in os.walk(root, onerror=skipped_dirs.append):
+        # Служебные папки Windows, куда всё равно нет доступа
+        dirnames[:] = [d for d in dirnames
+                       if d not in ("$RECYCLE.BIN", "System Volume Information")]
         for f in files:
+            # ._имя.mp4 — двойники macOS с флешек и сетевых дисков, внутри не запись,
+            # а четыре килобайта служебных данных; отправлять их в распознавание незачем.
+            if f.startswith("._"):
+                continue
             if os.path.splitext(f)[1].lower() in AUDIO_EXTS + VIDEO_EXTS:
                 targets.append(os.path.join(dirpath, f))
+    if skipped_dirs:
+        print(f"Внимание: {len(skipped_dirs)} папок не удалось прочитать (нет доступа) — "
+              "их содержимое не попадёт в расшифровку.")
     return sorted(targets)
 
 
@@ -789,7 +870,23 @@ def main():
     if "--check" in args:
         sys.exit(run_check())
 
-    root = args[0]
+    # Первым идёт путь или ссылка. Если агент поставил флаг первым — не падаем.
+    positional = [a for a in args if not a.startswith("--")]
+    # Значение --out позиционным не считается
+    if "--out" in args:
+        oi = args.index("--out")
+        if oi + 1 < len(args) and args[oi + 1] in positional:
+            positional.remove(args[oi + 1])
+    if "--set-key" in args:
+        positional = []
+    if not positional:
+        print_usage()
+        sys.exit(1)
+    root = positional[0]
+    # PowerShell при Tab-дополнении дописывает обратный слэш, и «C:\Записи\» в кавычках
+    # приезжает в argv как «C:\Записи"» — путь существует, а скрипт его «не находит».
+    if IS_WINDOWS:
+        root = root.rstrip('"').rstrip()
     plan_only = "--plan" in args
     # --groq оставлен для тех, кто за пределами России: Whisper там работает и бесплатен.
     # По умолчанию движок Deepgram — он единственный, кто отвечает из РФ.
@@ -811,6 +908,8 @@ def main():
             print("ОШИБКА: после --out нужен путь к папке.")
             sys.exit(1)
         out_dir = args[i + 1]
+        if IS_WINDOWS:
+            out_dir = out_dir.rstrip('"').rstrip()
         if not os.path.isdir(out_dir):
             print(f"ОШИБКА: папки нет: {out_dir}")
             sys.exit(1)
@@ -879,7 +978,10 @@ def main():
             except Exception as e:
                 print(f"      ОШИБКА: {e}")
                 failed += 1
-                downloaded_dir.cleanup()
+                try:
+                    downloaded_dir.cleanup()
+                except OSError:
+                    pass
                 continue
             title = os.path.splitext(os.path.basename(path))[0]
             md_path = os.path.join(out_dir, title + ".md")
@@ -887,7 +989,10 @@ def main():
             if already:
                 print(f"      ПРОПУСК (расшифровка уже есть): {os.path.basename(md_path)}")
                 skipped += 1
-                downloaded_dir.cleanup()
+                try:
+                    downloaded_dir.cleanup()
+                except OSError:
+                    pass
                 continue
         else:
             path = source
@@ -900,9 +1005,14 @@ def main():
 
         name = os.path.basename(path)
         dur = get_duration(path)
+        if dur <= 0 and not force_speakers and not force_no_speakers and not groq_mode:
+            print("      длительность файла не определилась — размечу спикеров на всякий "
+                  "случай (отключить: --no-speakers)", flush=True)
         # Разговор или заметка — решает длительность, пока флаг не сказал иначе.
+        # Длительность не определилась (ffprobe не смог) — считаем запись разговором:
+        # потерять разметку спикеров на созвоне хуже, чем получить её на заметке.
         diarize = force_speakers or (
-            not force_no_speakers and dur > SPEAKERS_THRESHOLD_SECONDS
+            not force_no_speakers and (dur <= 0 or dur > SPEAKERS_THRESHOLD_SECONDS)
         )
         if is_url:
             print(f"      {name}  (~{dur/60:.0f} мин)", flush=True)
@@ -951,8 +1061,13 @@ def main():
             failed += 1
         finally:
             # Скачанное по ссылке не копим на диске — расшифровка уже сохранена.
+            # На Windows временная папка иногда не удаляется сразу (файл ещё занят
+            # системой) — это не повод ронять прогон, расшифровка уже на диске.
             if downloaded_dir:
-                downloaded_dir.cleanup()
+                try:
+                    downloaded_dir.cleanup()
+                except OSError:
+                    pass
 
     print(f"\nИтог: готово {done}, пропущено {skipped}, ошибок {failed}")
     # Ненулевой код, если что-то упало: чтобы прогон в фоне или по расписанию
@@ -961,4 +1076,15 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        print("\nПрервано. Уже готовые расшифровки на месте, можно запустить снова.")
+        sys.exit(130)
+    except (BrokenPipeError, OSError) as e:
+        # Вывод обрезали (например, `| head`). На Windows это прилетает не
+        # BrokenPipeError, а OSError с WinError 232 / Errno 22 — ловим обе формы.
+        if isinstance(e, BrokenPipeError) or getattr(e, "errno", None) in (22, 32) \
+                or getattr(e, "winerror", None) == 232:
+            os._exit(0)
+        raise
