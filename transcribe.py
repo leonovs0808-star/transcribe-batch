@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import mimetypes
 import os
@@ -172,11 +173,19 @@ def set_key(args: list[str]) -> int:
 
     key = args[i + 2].strip() if len(args) > i + 2 else ""
     if not key:
+        # getpass не печатает набранное на экран: ключ не останется ни в окне
+        # терминала, ни в его логе, ни на скриншоте.
         try:
-            key = input(f"Вставь {var} и нажми Enter: ").strip()
-        except EOFError:
-            print("ОШИБКА: ключ не введён.")
+            key = getpass.getpass(f"Вставь {var} (ввод не отображается) и нажми Enter: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nОШИБКА: ключ не введён.")
             return 1
+        except Exception:
+            try:
+                key = input(f"Вставь {var} и нажми Enter: ").strip()
+            except EOFError:
+                print("ОШИБКА: ключ не введён.")
+                return 1
     if not key or is_placeholder(key):
         print("ОШИБКА: это не похоже на ключ.")
         return 1
@@ -467,7 +476,11 @@ def download_with_ytdlp(url: str, out_dir: str) -> str:
     except ImportError:
         raise RuntimeError(
             "для ссылок на видеохостинги нужен yt-dlp, его нет.\n"
-            f"      Поставь одной командой:  {PY} -m pip install -U yt-dlp\n"
+            f"      Поставь:  {PY} -m pip install -U yt-dlp\n"
+            "      Ответит «externally-managed-environment» (свежие Ubuntu/Debian, питон\n"
+            f"      из Homebrew) — добавь флаг:  {PY} -m pip install -U --break-system-packages yt-dlp\n"
+            "      Через pipx ставить НЕ надо: скрипт подключает yt-dlp как библиотеку,\n"
+            "      а pipx прячет её в отдельное окружение, и она не подхватится.\n"
             "      Ссылки на Яндекс.Диск, Google Drive и прямые файлы работают без него."
         )
     import yt_dlp
@@ -878,7 +891,8 @@ def main():
             title = os.path.splitext(name)[0]
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(f"# {title}\n\n{text}\n")
-            print(f"      готово за {(time.time()-t0)/60:.1f} мин: {os.path.basename(md_path)}")
+            shown = os.path.abspath(md_path) if is_url else os.path.basename(md_path)
+            print(f"      готово за {(time.time()-t0)/60:.1f} мин: {shown}")
             done += 1
         except Exception as e:
             text = str(e)
