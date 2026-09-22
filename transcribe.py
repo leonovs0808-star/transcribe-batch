@@ -54,6 +54,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 IS_WINDOWS = platform.system() == "Windows"
 PY = "python" if IS_WINDOWS else "python3"
 
+# Консоль Windows по умолчанию живёт в cp1251/cp866, и любая строка с кириллицей
+# роняет скрипт на ровном месте: UnicodeEncodeError вместо сообщения об ошибке.
+# Здесь весь вывод переводится в UTF-8, а непечатаемое заменяется, а не рушит прогон.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # питон < 3.7 или подменённый поток
+        pass
+
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 
@@ -139,13 +148,42 @@ def ffmpeg_install_hint() -> str:
     return "sudo apt install ffmpeg"
 
 
-def require_tool(name: str):
-    """Проверяет, что ffmpeg/ffprobe виден в PATH. Иначе — понятная ошибка вместо трейсбека."""
-    if shutil.which(name) is None:
-        print(f"ОШИБКА: {name} не найден в PATH.")
-        print(f"Установи ffmpeg: {ffmpeg_install_hint()}")
-        print("После установки открой терминал заново (PATH подхватывается при запуске).")
-        sys.exit(1)
+# Куда Homebrew и популярные установщики кладут ffmpeg. Нужны потому, что PATH
+# неинтерактивной оболочки (а именно в ней живёт ИИ-агент) на маке выглядит как
+# /usr/bin:/bin:/usr/sbin:/sbin — без Homebrew. Проверено на живом маке: ffmpeg
+# стоит в /opt/homebrew/bin, а shutil.which его не находит, и человек получает
+# «установи ffmpeg» на уже установленный ffmpeg.
+EXTRA_TOOL_DIRS = (
+    "/opt/homebrew/bin",      # Homebrew на Apple Silicon
+    "/usr/local/bin",         # Homebrew на Intel-маке и ручная установка
+    "/opt/local/bin",         # MacPorts
+    "/snap/bin",              # Linux со snap
+    os.path.expanduser("~/bin"),
+    os.path.expanduser("~/.local/bin"),
+)
+
+
+def find_tool(name: str) -> str | None:
+    """Ищет программу в PATH, а если её там нет — в типичных местах установки."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for folder in EXTRA_TOOL_DIRS:
+        candidate = os.path.join(folder, name + (".exe" if IS_WINDOWS else ""))
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def require_tool(name: str) -> str:
+    """Возвращает путь к ffmpeg/ffprobe. Нет нигде — понятная ошибка вместо трейсбека."""
+    found = find_tool(name)
+    if found:
+        return found
+    print(f"ОШИБКА: {name} не найден.")
+    print(f"Установи ffmpeg: {ffmpeg_install_hint()}")
+    print("После установки открой терминал заново (PATH подхватывается при запуске).")
+    sys.exit(1)
 
 
 def proxy_note() -> str:
@@ -247,7 +285,7 @@ def run_check():
     print(f"ОС:        {platform.system()} {platform.release()}")
     print(f"Python:    {platform.python_version()} ({sys.executable})")
     for tool in ("ffmpeg", "ffprobe"):
-        path = shutil.which(tool)
+        path = find_tool(tool)
         print(f"{tool + ':':10} {path if path else 'НЕ НАЙДЕН — ' + ffmpeg_install_hint()}")
     print(f"Файл .env: {os.path.join(SCRIPT_DIR, '.env')}")
     print("Проверяю ключи у сервисов...", flush=True)
@@ -264,7 +302,7 @@ def run_check():
         print(f"GROQ_API_KEY:     {groq_note}")
     print(f"Прокси:    {proxy_note()}")
 
-    tools_ok = shutil.which("ffmpeg") and shutil.which("ffprobe")
+    tools_ok = find_tool("ffmpeg") and find_tool("ffprobe")
     if tools_ok and (deepgram_ok or groq_ok):
         print("\nГотово к работе.")
         return 0
@@ -554,6 +592,7 @@ def download_url(url: str, out_dir: str) -> str:
 
 
 def run_ffmpeg(cmd: list[str]):
+    cmd = [require_tool(cmd[0])] + cmd[1:]
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg извлечение аудио упало: {(r.stderr or '')[-400:]}")
@@ -597,7 +636,7 @@ def prepare_for_deepgram(media_path: str, tmp_dir: str) -> tuple[str, str]:
 def get_duration(path: str) -> float:
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [require_tool("ffprobe"), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, errors="replace",
         )
