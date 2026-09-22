@@ -1,11 +1,15 @@
 """
-Пакетная транскрипция аудио/видео в текст через Groq Whisper (и опционально Deepgram
-с разделением по спикерам).
+Пакетная расшифровка аудио/видео в текст. Движок по умолчанию — Deepgram nova-3:
+он работает из любой страны, включая Россию, и сам размечает спикеров.
 
 Для каждого файла:
   1. ffmpeg извлекает аудио в mp3 (mono 16kHz)
-  2. аудио режется на куски (лимит Groq ~25 МБ) и транскрибируется
+  2. аудио уходит в распознавание (для Groq — кусками, у него лимит ~25 МБ)
   3. результат сохраняется в .md рядом с исходником, с тем же именем
+
+Записи длиннее трёх минут размечаются по спикерам ("Спикер 1: ..."), короткие —
+сплошным текстом: короткая запись почти всегда мысль вслух, метки в ней мешают.
+Флаги --speakers / --no-speakers перебивают это решение.
 
 Безопасно перезапускать: если .md уже есть — файл пропускается.
 
@@ -19,10 +23,11 @@
     python3 transcribe.py "/путь/к/папке"
   Только план (что будет обработано, без запуска):
     python3 transcribe.py "/путь/к/папке" --plan
-  С разделением по спикерам (Deepgram nova-3 — для диалогов/интервью, нужен DEEPGRAM_API_KEY):
+  Принудительно с разделением по спикерам / принудительно без него:
     python3 transcribe.py "/путь/к/папке" --speakers
-  На движке Deepgram вместо Groq (нужен там, где Groq не обслуживает страну — например в РФ):
-    python3 transcribe.py "/путь/к/папке" --deepgram
+    python3 transcribe.py "/путь/к/папке" --no-speakers
+  На движке Groq Whisper (бесплатен, но из России отдаёт HTTP 403):
+    python3 transcribe.py "/путь/к/папке" --groq
   Проверить, что всё установлено:
     python3 transcribe.py --check
 """
@@ -58,7 +63,13 @@ GROQ_MODEL = "whisper-large-v3"
 DEEPGRAM_MODEL = "nova-3"
 MAX_BYTES = 24 * 1024 * 1024  # 24 МБ — лимит Groq
 CHUNK_SECONDS = 600  # 10 минут на кусок (при 16kHz mono 32k mp3 ~ 2.4 МБ/10мин)
-HTTP_TIMEOUT = 900  # секунд на один запрос
+HTTP_TIMEOUT = 1800  # секунд на один запрос (длинный эфир уходит в Deepgram одним куском)
+
+# Порог, после которого запись считается разговором, а не заметкой, и включается
+# разделение по спикерам. Короткая запись — почти всегда диктофонная мысль вслух,
+# метки «Спикер 1» в ней только мешают. Длинная — созвон, интервью, лекция.
+# Перебивается флагами --speakers / --no-speakers.
+SPEAKERS_THRESHOLD_SECONDS = 180
 
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 AUDIO_EXTS = (".ogg", ".mp3", ".m4a", ".aac", ".wav", ".opus")
@@ -80,19 +91,33 @@ def read_env_value(name: str) -> str | None:
     return None
 
 
-def load_groq_key() -> str:
-    key = read_env_value("GROQ_API_KEY")
-    if key:
+def is_placeholder(value: str | None) -> bool:
+    """Ключ из .env.example, который забыли заменить на настоящий."""
+    return not value or value.startswith("gsk_твой") or value.startswith("твой")
+
+
+def load_deepgram_key() -> str:
+    key = read_env_value("DEEPGRAM_API_KEY")
+    if not is_placeholder(key):
         return key
-    print("ОШИБКА: GROQ_API_KEY не найден (ни в переменных окружения, ни в .env)")
-    print("Получи бесплатный ключ на https://console.groq.com/keys")
-    print(f"и положи его в файл .env рядом со скриптом ({os.path.join(SCRIPT_DIR, '.env')}):")
-    print("  GROQ_API_KEY=gsk_твой_ключ")
+    print("ОШИБКА: DEEPGRAM_API_KEY не найден (ни в переменных окружения, ни в .env)")
+    print("Получи бесплатный ключ на https://console.deepgram.com/ — карту не спрашивают,")
+    print("на счёт сразу кладут $200, этого хватает примерно на 700 часов расшифровки.")
+    print(f"Положи его в файл .env рядом со скриптом ({os.path.join(SCRIPT_DIR, '.env')}):")
+    print("  DEEPGRAM_API_KEY=твой_ключ")
     sys.exit(1)
 
 
-def load_deepgram_key() -> str | None:
-    return read_env_value("DEEPGRAM_API_KEY")
+def load_groq_key() -> str:
+    key = read_env_value("GROQ_API_KEY")
+    if not is_placeholder(key):
+        return key
+    print("ОШИБКА: GROQ_API_KEY не найден (нужен для --groq).")
+    print("Получи бесплатный ключ на https://console.groq.com/keys")
+    print(f"и положи его в файл .env рядом со скриптом ({os.path.join(SCRIPT_DIR, '.env')}):")
+    print("  GROQ_API_KEY=gsk_твой_ключ")
+    print("Из России Groq не работает (HTTP 403) — там запускай без --groq, на Deepgram.")
+    sys.exit(1)
 
 
 # ── Проверка окружения ────────────────────────────────────────────────────────
@@ -128,13 +153,16 @@ def run_check():
     for tool in ("ffmpeg", "ffprobe"):
         path = shutil.which(tool)
         print(f"{tool + ':':10} {path if path else 'НЕ НАЙДЕН — ' + ffmpeg_install_hint()}")
-    groq = read_env_value("GROQ_API_KEY")
-    deepgram = read_env_value("DEEPGRAM_API_KEY")
-    print(f"GROQ_API_KEY:     {'есть' if groq and not groq.startswith('gsk_твой') else 'НЕ ЗАДАН'}")
-    print(f"DEEPGRAM_API_KEY: {'есть' if deepgram and not deepgram.startswith('твой') else 'не задан (нужен только для --speakers)'}")
+    deepgram_ok = not is_placeholder(read_env_value("DEEPGRAM_API_KEY"))
+    groq_ok = not is_placeholder(read_env_value("GROQ_API_KEY"))
+    print(f"DEEPGRAM_API_KEY: {'есть' if deepgram_ok else 'НЕ ЗАДАН — https://console.deepgram.com/'}")
+    print(f"GROQ_API_KEY:     {'есть' if groq_ok else 'не задан (нужен только для --groq, из России не работает)'}")
     print(f"Прокси:    {proxy_note()}")
-    ok = shutil.which("ffmpeg") and shutil.which("ffprobe") and groq and not groq.startswith("gsk_твой")
-    print("\nГотово к работе." if ok else "\nЕсть чего не хватает — см. выше.")
+    tools_ok = shutil.which("ffmpeg") and shutil.which("ffprobe")
+    if tools_ok and (deepgram_ok or groq_ok):
+        print("\nГотово к работе.")
+    else:
+        print("\nЕсть чего не хватает — см. выше.")
 
 
 # ── HTTP на стандартной библиотеке (без curl) ─────────────────────────────────
@@ -218,28 +246,74 @@ def add_paragraphs(text: str, sentences_per_paragraph: int = 4) -> str:
     return "\n\n".join(paragraphs)
 
 
-def output_path_for(media_path: str) -> str:
-    """Куда писать расшифровку. По умолчанию <имя>.md рядом с медиа.
-       Если рядом уже лежит .md — добавляет .расшифровка.md, чтобы не перезаписать чужой файл."""
+def looks_like_our_transcript(md_path: str, media_path: str) -> bool:
+    """Свою расшифровку узнаём по первой строке — скрипт пишет её как '# <имя файла>'."""
+    title = os.path.splitext(os.path.basename(media_path))[0]
+    try:
+        with open(md_path, encoding="utf-8") as f:
+            return f.readline().strip() == f"# {title}"
+    except OSError:
+        return False
+
+
+def output_path_for(media_path: str) -> tuple[str, bool]:
+    """Возвращает (куда писать, сделано ли уже).
+
+    Рядом с медиа может лежать чужой .md — конспект урока, заметка. Его не трогаем:
+    пишем в <имя>.расшифровка.md. А вот свою собственную расшифровку узнаём по первой
+    строке и второй раз не делаем. Без этой проверки повторный запуск на той же папке
+    расшифровывал всё заново, в обход обещанного пропуска, и платил за это дважды.
+    """
     base, _ = os.path.splitext(media_path)
     plain = base + ".md"
+    suffixed = base + ".расшифровка.md"
     if not os.path.exists(plain):
-        return plain
-    return base + ".расшифровка.md"
+        return plain, False
+    if looks_like_our_transcript(plain, media_path):
+        return plain, True
+    return suffixed, os.path.exists(suffixed)
 
 
 # ── ffmpeg ────────────────────────────────────────────────────────────────────
+def run_ffmpeg(cmd: list[str]):
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg извлечение аудио упало: {(r.stderr or '')[-400:]}")
+
+
 def extract_audio(video_path: str, out_mp3: str):
-    """Извлекает аудио в mp3 mono 16kHz 32kbps."""
-    cmd = [
+    """Извлекает аудио в mp3 mono 16kHz 32kbps — экономно, под лимит Groq в 25 МБ."""
+    run_ffmpeg([
         "ffmpeg", "-y", "-i", video_path,
         "-vn", "-acodec", "libmp3lame",
         "-ar", "16000", "-ac", "1", "-b:a", "32k",
         out_mp3,
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-    if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg извлечение аудио упало: {(r.stderr or '')[-400:]}")
+    ])
+
+
+def prepare_for_deepgram(media_path: str, tmp_dir: str) -> tuple[str, str]:
+    """Готовит файл для Deepgram, возвращает (путь, content-type).
+
+    Здесь принципиально НЕ жмём звук. Повторное сжатие в mp3 стирает тембровую
+    разницу между голосами, и движок перестаёт различать спикеров: проверено —
+    одна и та же запись даёт двух спикеров в оригинале и одного после прогона
+    через mp3 32 kbps. Поэтому:
+      - аудиофайл уходит как есть, вообще без ffmpeg;
+      - из видео звук вынимается в FLAC (сжатие без потерь) — точность та же,
+        что у WAV, а весит вдвое меньше.
+    У Deepgram лимит на файл 2 ГБ, экономить на качестве незачем.
+    """
+    ext = os.path.splitext(media_path)[1].lower()
+    if ext in AUDIO_EXTS:
+        ctype = mimetypes.guess_type(media_path)[0] or "application/octet-stream"
+        return media_path, ctype
+    out_flac = os.path.join(tmp_dir, "audio.flac")
+    run_ffmpeg([
+        "ffmpeg", "-y", "-i", media_path,
+        "-vn", "-acodec", "flac", "-ar", "16000", "-ac", "1",
+        out_flac,
+    ])
+    return out_flac, "audio/flac"
 
 
 def get_duration(path: str) -> float:
@@ -314,16 +388,18 @@ def transcribe_video(video_path: str, key: str) -> str:
 
 
 # ── Deepgram (разделение по спикерам) ─────────────────────────────────────────
-def transcribe_deepgram(mp3_path: str, key: str) -> str:
-    """Отправляет аудио в Deepgram nova-3 с diarization, возвращает текст.
-       Монолог (один спикер занимает >=80% реплик) — без меток, диалог — с "Спикер N:"."""
-    with open(mp3_path, "rb") as f:
+def transcribe_deepgram(audio_path: str, key: str, diarize: bool, ctype: str) -> str:
+    """Отправляет аудио в Deepgram nova-3, возвращает текст.
+       diarize=True — реплики размечаются как "Спикер N:". Если движок нашёл в записи
+       только один голос, меток не будет: размечать монолог нечем и незачем."""
+    with open(audio_path, "rb") as f:
         payload = f.read()
     url = (f"{DEEPGRAM_URL}?model={DEEPGRAM_MODEL}&detect_language=true"
-           "&diarize=true&punctuate=true&utterances=true")
+           f"&punctuate=true&diarize={'true' if diarize else 'false'}"
+           f"&utterances={'true' if diarize else 'false'}")
     raw = http_post(
         url,
-        {"Authorization": f"Token {key}", "Content-Type": "audio/mpeg"},
+        {"Authorization": f"Token {key}", "Content-Type": ctype},
         payload,
     )
     data = json.loads(raw.decode("utf-8", "replace"))
@@ -332,13 +408,7 @@ def transcribe_deepgram(mp3_path: str, key: str) -> str:
     if not utterances:
         return data["results"]["channels"][0]["alternatives"][0]["transcript"]
 
-    unique_speakers = {u["speaker"] for u in utterances}
-    dominant_count = max(
-        sum(1 for u in utterances if u["speaker"] == s) for s in unique_speakers
-    )
-    is_monologue = len(unique_speakers) == 1 or dominant_count / len(utterances) >= 0.8
-
-    if is_monologue:
+    if len({u["speaker"] for u in utterances}) == 1:
         return " ".join(u["transcript"] for u in utterances)
 
     blocks = []
@@ -351,46 +421,39 @@ def transcribe_deepgram(mp3_path: str, key: str) -> str:
     return "\n\n".join(f"Спикер {speaker + 1}: {' '.join(parts)}" for speaker, parts in blocks)
 
 
-def transcribe_video_speakers(video_path: str, key: str) -> str:
-    """Видео/аудио -> mp3 -> Deepgram с разделением по спикерам."""
+def transcribe_video_deepgram(media_path: str, key: str, diarize: bool) -> str:
+    """Видео/аудио -> Deepgram. Аудио уходит как есть, из видео звук вынимается в FLAC."""
     with tempfile.TemporaryDirectory() as tmp:
-        mp3 = os.path.join(tmp, "audio.mp3")
-        extract_audio(video_path, mp3)
-        return transcribe_deepgram(mp3, key)
+        audio, ctype = prepare_for_deepgram(media_path, tmp)
+        return transcribe_deepgram(audio, key, diarize, ctype)
 
 
 # ── Обход папки ───────────────────────────────────────────────────────────────
 def collect_targets(root: str) -> list[str]:
-    """Дедуп по папке:
-       - если в папке есть аудио (.ogg и т.п.) — это главный урок; берём аудио,
-         а самый большой mp4 (дубль главного урока) пропускаем,
-         остальные mp4 (примеры, вебинары) берём;
-       - если аудио в папке нет — берём все видео."""
+    """Все аудио и видео в папке, рекурсивно. Ничего не отсеивает молча:
+       что лежит в папке — то и будет расшифровано, список видно по --plan."""
     targets = []
     for dirpath, _, files in os.walk(root):
-        audios = [os.path.join(dirpath, f) for f in files
-                  if os.path.splitext(f)[1].lower() in AUDIO_EXTS]
-        videos = [os.path.join(dirpath, f) for f in files
-                  if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
-
-        if audios:
-            targets.extend(audios)
-            if videos:
-                main_video = max(videos, key=lambda p: os.path.getsize(p))
-                targets.extend(v for v in videos if v != main_video)
-        else:
-            targets.extend(videos)
+        for f in files:
+            if os.path.splitext(f)[1].lower() in AUDIO_EXTS + VIDEO_EXTS:
+                targets.append(os.path.join(dirpath, f))
     return sorted(targets)
 
 
 def print_usage():
     print("Использование:")
     print(f'  {PY} transcribe.py "путь/к/файлу.mp4"')
-    print(f'  {PY} transcribe.py "путь/к/папке"          (рекурсивно, все аудио/видео)')
-    print(f'  {PY} transcribe.py "путь/к/папке" --plan   (только план, без запуска)')
-    print(f'  {PY} transcribe.py "путь/к/папке" --speakers  (с разделением по спикерам, Deepgram)')
-    print(f'  {PY} transcribe.py "путь/к/папке" --deepgram  (движок Deepgram вместо Groq)')
-    print(f"  {PY} transcribe.py --check                 (проверить установку)")
+    print(f'  {PY} transcribe.py "путь/к/папке"              (рекурсивно, все аудио/видео)')
+    print(f'  {PY} transcribe.py "путь/к/папке" --plan       (только план, без запуска)')
+    print(f"  {PY} transcribe.py --check                     (проверить установку)")
+    print()
+    print("Разделение по спикерам включается само на записях длиннее "
+          f"{SPEAKERS_THRESHOLD_SECONDS // 60} минут. Перебить вручную:")
+    print(f'  {PY} transcribe.py "путь" --speakers          (всегда с «Спикер 1/2»)')
+    print(f'  {PY} transcribe.py "путь" --no-speakers       (всегда сплошным текстом)')
+    print()
+    print("Движок по умолчанию — Deepgram (работает везде, в том числе из России).")
+    print(f'  {PY} transcribe.py "путь" --groq              (Groq Whisper; из РФ отдаёт 403)')
 
 
 def main():
@@ -404,8 +467,16 @@ def main():
 
     root = args[0]
     plan_only = "--plan" in args
-    speakers_mode = "--speakers" in args
-    deepgram_mode = speakers_mode or "--deepgram" in args
+    # --groq оставлен для тех, кто за пределами России: Whisper там работает и бесплатен.
+    # По умолчанию движок Deepgram — он единственный, кто отвечает из РФ.
+    # "--deepgram" принимаем молча: так звали движок в старых инструкциях.
+    groq_mode = "--groq" in args
+    # Разделение по спикерам: по умолчанию решает длительность записи, флаги перебивают.
+    force_speakers = "--speakers" in args
+    force_no_speakers = "--no-speakers" in args
+    if force_speakers and force_no_speakers:
+        print("ОШИБКА: --speakers и --no-speakers вместе не имеют смысла, выбери одно.")
+        sys.exit(1)
 
     if os.path.isfile(root):
         targets = [root]
@@ -422,32 +493,30 @@ def main():
     if not plan_only:
         require_tool("ffmpeg")
         require_tool("ffprobe")
-        if deepgram_mode:
-            deepgram_key = load_deepgram_key()
-            if not deepgram_key:
-                flag = "--speakers" if speakers_mode else "--deepgram"
-                print(f"ОШИБКА: DEEPGRAM_API_KEY не найден (нужен для {flag}).")
-                print("Получи ключ на https://console.deepgram.com/ и добавь в .env:")
-                print("  DEEPGRAM_API_KEY=твой_ключ")
-                sys.exit(1)
-        else:
+        if groq_mode:
             groq_key = load_groq_key()
-            deepgram_key = load_deepgram_key()  # запасной движок, если Groq не обслуживает страну
+            # Запасной движок: Groq откажет по стране — уйдём на Deepgram, если ключ есть.
+            deepgram_key = read_env_value("DEEPGRAM_API_KEY")
+            if is_placeholder(deepgram_key):
+                deepgram_key = None
+        else:
+            deepgram_key = load_deepgram_key()
 
     print(f"Найдено файлов для транскрипции: {len(targets)}")
-    if speakers_mode:
-        engine_name = "Deepgram nova-3 (с разделением по спикерам)"
-    elif deepgram_mode:
-        engine_name = "Deepgram nova-3"
-    else:
-        engine_name = "Groq Whisper"
-    print(f"Движок: {engine_name}")
+    print(f"Движок: {'Groq ' + GROQ_MODEL if groq_mode else 'Deepgram ' + DEEPGRAM_MODEL}")
+    if force_speakers:
+        print("Спикеры: размечаю везде (--speakers)")
+    elif force_no_speakers:
+        print("Спикеры: не размечаю (--no-speakers)")
+    elif not groq_mode:
+        print(f"Спикеры: размечаю на записях длиннее "
+              f"{SPEAKERS_THRESHOLD_SECONDS // 60} мин (короткие — сплошным текстом)")
     print(f"Прокси: {proxy_note()}\n")
 
     if plan_only:
         for i, path in enumerate(targets, 1):
-            md_path = output_path_for(path)
-            mark = "уже есть" if os.path.exists(md_path) else "обработать"
+            _, already = output_path_for(path)
+            mark = "уже есть" if already else "обработать"
             rel = os.path.relpath(path, base_dir)
             print(f"[{i:2}] {mark:12} {rel}")
         print("\n(это только план, транскрипция не запущена — убери --plan чтобы запустить)")
@@ -455,19 +524,23 @@ def main():
 
     done, skipped, failed = 0, 0, 0
     for i, path in enumerate(targets, 1):
-        md_path = output_path_for(path)
+        md_path, already = output_path_for(path)
         name = os.path.basename(path)
-        if os.path.exists(md_path):
-            print(f"[{i}/{len(targets)}] ПРОПУСК (уже есть .md): {name}")
+        if already:
+            print(f"[{i}/{len(targets)}] ПРОПУСК (расшифровка уже есть): {name}")
             skipped += 1
             continue
 
         dur = get_duration(path)
+        # Разговор или заметка — решает длительность, пока флаг не сказал иначе.
+        diarize = force_speakers or (
+            not force_no_speakers and dur > SPEAKERS_THRESHOLD_SECONDS
+        )
         print(f"[{i}/{len(targets)}] {name}  (~{dur/60:.0f} мин)", flush=True)
         try:
             t0 = time.time()
-            if deepgram_mode:
-                text = transcribe_video_speakers(path, deepgram_key)
+            if not groq_mode:
+                text = transcribe_video_deepgram(path, deepgram_key, diarize)
                 if "Спикер " not in text:
                     text = add_paragraphs(text)
             else:
@@ -479,8 +552,8 @@ def main():
                     # Groq не обслуживает страну пользователя — переходим на Deepgram.
                     # Настройки VPN/прокси пользователя при этом не трогаем.
                     print("      Groq недоступен из этой страны (403), перехожу на Deepgram...", flush=True)
-                    deepgram_mode = True
-                    text = transcribe_video_speakers(path, deepgram_key)
+                    groq_mode = False
+                    text = transcribe_video_deepgram(path, deepgram_key, diarize)
                     if "Спикер " not in text:
                         text = add_paragraphs(text)
             title = os.path.splitext(name)[0]
