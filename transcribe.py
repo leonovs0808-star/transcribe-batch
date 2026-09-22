@@ -152,6 +152,35 @@ def proxy_note() -> str:
     return f"да ({proxy})" if proxy else "нет (прямое подключение)"
 
 
+def probe_key(service: str) -> tuple[bool, str]:
+    """Спрашивает у сервиса, принимает ли он ключ. Возвращает (годен, что сказать).
+
+    Без этого проверка врала: она видела только, что в .env что-то вписано, и
+    печатала «Готово к работе» на ключе с опечаткой. Человек шёл дальше и упирался
+    в HTTP 401 уже на своём файле, не понимая, при чём тут ключ.
+    """
+    key = read_env_value(f"{service.upper()}_API_KEY")
+    if is_placeholder(key):
+        return False, "НЕ ЗАДАН"
+    if service == "deepgram":
+        url, headers = "https://api.deepgram.com/v1/projects", {"Authorization": f"Token {key}"}
+    else:
+        url, headers = "https://api.groq.com/openai/v1/models", {"Authorization": f"Bearer {key}"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30):
+            return True, "есть, ключ принят"
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False, "вписан, но сервис его НЕ ПРИНЯЛ (401) — проверь, нет ли лишних пробелов, или создай новый"
+        if e.code == 403:
+            return False, "вписан, но сервис не обслуживает твою страну (403)"
+        return False, f"вписан, но сервис ответил HTTP {e.code}"
+    except Exception as e:
+        # Нет сети — это не повод объявлять ключ негодным.
+        return True, f"вписан, проверить не смог ({type(e).__name__}) — похоже, нет интернета"
+
+
 def run_check():
     """python3 transcribe.py --check — показывает, что готово, а что нет."""
     print(f"ОС:        {platform.system()} {platform.release()}")
@@ -159,16 +188,27 @@ def run_check():
     for tool in ("ffmpeg", "ffprobe"):
         path = shutil.which(tool)
         print(f"{tool + ':':10} {path if path else 'НЕ НАЙДЕН — ' + ffmpeg_install_hint()}")
-    deepgram_ok = not is_placeholder(read_env_value("DEEPGRAM_API_KEY"))
-    groq_ok = not is_placeholder(read_env_value("GROQ_API_KEY"))
-    print(f"DEEPGRAM_API_KEY: {'есть' if deepgram_ok else 'НЕ ЗАДАН — https://console.deepgram.com/'}")
-    print(f"GROQ_API_KEY:     {'есть' if groq_ok else 'не задан (нужен только для --groq, из России не работает)'}")
+    print(f"Файл .env: {os.path.join(SCRIPT_DIR, '.env')}")
+    print("Проверяю ключи у сервисов...", flush=True)
+
+    deepgram_ok, deepgram_note = probe_key("deepgram")
+    print(f"DEEPGRAM_API_KEY: {deepgram_note}"
+          + ("" if deepgram_ok else " — ключ берётся на https://console.deepgram.com/"))
+    groq_key = read_env_value("GROQ_API_KEY")
+    if is_placeholder(groq_key):
+        groq_ok = False
+        print("GROQ_API_KEY:     не задан (нужен только для --groq, из России не работает)")
+    else:
+        groq_ok, groq_note = probe_key("groq")
+        print(f"GROQ_API_KEY:     {groq_note}")
     print(f"Прокси:    {proxy_note()}")
+
     tools_ok = shutil.which("ffmpeg") and shutil.which("ffprobe")
     if tools_ok and (deepgram_ok or groq_ok):
         print("\nГотово к работе.")
-    else:
-        print("\nЕсть чего не хватает — см. выше.")
+        return 0
+    print("\nЕсть чего не хватает — см. выше.")
+    return 1
 
 
 # ── HTTP на стандартной библиотеке (без curl) ─────────────────────────────────
@@ -640,8 +680,7 @@ def main():
         print_usage()
         sys.exit(1)
     if "--check" in args:
-        run_check()
-        return
+        sys.exit(run_check())
 
     root = args[0]
     plan_only = "--plan" in args
@@ -795,7 +834,10 @@ def main():
                 downloaded_dir.cleanup()
 
     print(f"\nИтог: готово {done}, пропущено {skipped}, ошибок {failed}")
+    # Ненулевой код, если что-то упало: чтобы прогон в фоне или по расписанию
+    # не выглядел успешным при полностью провалившейся пачке.
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
